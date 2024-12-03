@@ -1,0 +1,370 @@
+---
+title: "AmPro"
+output: html_document
+date: "2024-11-21"
+---
+#*all notes are written above the lines of code they relate to***
+
+#In order to use dada2 for this process, we need to load in our downloaded package:
+
+```{R}
+library(dada2)
+```
+
+#Next we need to set our working directory so that R knows where to find your data files and we will make this an object "path"
+
+path<-setwd("C:/Users/Jenna/Documents/Bioinfo/Assignment_3")
+
+#To double check that we are in the right directory we use "list.files" to inspect what files R has access to in the current session (you should see the files you want to process)
+
+```{r}
+list.files(path) #lists files in the folder
+```
+#Now we will read in the names of the fastq files, and perform some string manipulation to get matched lists of the forward and reverse fastq files. This identifies which files are forward sequences and which are reverse.
+
+#This assumes the Forward and reverse fastq filenames have format: SAMPLENAME_R1_001.fastq and SAMPLENAME_R2_001.fastq
+#File naming is something that could be the same everytime if you use the same sequencing center but can differ center-center. Need to know what format your center uses to mark forward vs reverse
+#Might need to trouble shoot if your file naming is different than this format
+
+```{r}
+# Extract sample names, assuming filenames have format: SAMPLENAME_XXX.fastq
+fnFs <- sort(list.files(path, pattern="_R1_001.fastq", full.names = TRUE))
+fnRs <- sort(list.files(path, pattern="_R2_001.fastq", full.names = TRUE))
+
+#takes the samples names from each file by deleting everything after the _
+sample.names <- sapply(strsplit(basename(fnFs), "_"), `[`, 1)
+```
+
+#Next we want to look at the quality of our sequences so we can pick our cut off points:
+
+```{r}
+#look at the first few forward samples to see where the quality is good and where we can tell R to merge the forward and reverse sequences
+#looking for where the quality dips so you can pick your cut offs
+plotQualityProfile(fnFs[1:2])
+```
+
+#Then we do the same with the reverse reads:
+
+```{R}
+plotQualityProfile(fnRs[1:2])
+```
+#Now we need to assign file names for the filtered fastq.gz files
+
+```{R}
+# Place filtered files in filtered/ subdirectory
+filtFs <- file.path(path, "filtered", paste0(sample.names, "_F_filt.fastq.gz"))
+filtRs <- file.path(path, "filtered", paste0(sample.names, "_R_filt.fastq.gz"))
+names(filtFs) <- sample.names
+names(filtRs) <- sample.names
+```
+
+#Next we will trim and filter our sequences. You must select different end points everytime you run a different set of seqeuences.
+
+#When choosing our end points if we choose to high if a quality score, we will end up throwing out pretty much all of our data by having too large of a gap between the two sequences. If we choose too low of a quality score it can be amibguous results that can't be very well compared to the database or won't match up well so will also throw out a lot of data. A 30 quality score is pretty good to aim for.
+#maxN= how many N reads are you allowing, because dada2 uses ASV it only matches exact matching seqeunces so it actually has to be set to 0
+
+#If you want to speed up downstream computation, consider tightening maxEE. If too few reads are passing the filter, consider relaxing maxEE, perhaps especially on the reverse reads (eg. maxEE=c(2,5)), and reducing the truncLen to remove low quality tails. Remember though, when choosing truncLen for paired-end reads you must maintain overlap after truncation in order to merge them later.
+
+
+```{r}
+out <- filterAndTrim(fnFs, filtFs, fnRs, filtRs, truncLen=c(245,193),
+              maxN=0, maxEE=c(2,3), truncQ=2, rm.phix=TRUE,
+              compress=TRUE, multithread=FALSE) #On Windows set multithread=FALSE 
+              
+head(out)
+```
+
+#Then we use our filtered reads to learn the error rates (this step can take time to run)
+#First we'll run the forward sequences:
+
+```{r}
+errF <- learnErrors(filtFs, multithread=FALSE)
+
+```
+
+#And then we'll do the same for the reverse sequences
+
+```{r}
+errR <- learnErrors(filtRs, multithread=FALSE)
+```
+
+#It is worthwhile to now plot out the error rates and look at it for a sanity check to see what the quality looks like
+
+```{r}
+plotErrors(errF, nominalQ=TRUE)
+```
+
+#Now we are ready to apply the core sample inference algorithm to the filtered and trimmed sequence data first with the forward sequences:
+
+```{r}
+dadaFs <- dada(filtFs, err=errF, multithread=FALSE)
+```
+
+#And then with the reverse sequences:
+
+```{r}
+dadaRs <- dada(filtRs, err=errR, multithread=FALSE)
+```
+
+#inspect dada-class object:
+
+dadaFs[[1]]
+
+#Now this step is where after all of our curation we are finally merging our reads and will find out how many pairings we go
+#Most of your reads should successfully merge. If that is not the case upstream parameters may need to be revisited: Did you trim away the overlap between your reads?
+
+```{r}
+mergers <- mergePairs(dadaFs, filtFs, dadaRs, filtRs, verbose=TRUE)
+# Inspect the merger data.frame from the first sample
+head(mergers[[1]])
+```
+
+#We can now make an ASV table and can inspect the distribution of sequence lengths. They should all be within a few base pairs lengths of each other.Sequences that are much longer or shorter than expected may be the result of non-specific priming. You can remove non-target-length sequences from your sequence table (eg. seqtab2 <- seqtab[,nchar(colnames(seqtab)) %in% 250:256]). This is analogous to “cutting a band” in-silico to get amplicons of the targeted length
+
+```{r}
+seqtab <- makeSequenceTable(mergers)
+dim(seqtab)
+
+# Inspect distribution of sequence lengths
+table(nchar(getSequences(seqtab)))
+```
+
+#Now we will remove chimera sequences: It isn't uncommon to have more than 1 but most of your reads should remain after chimera removal (it is not uncommon for a majority of sequence variants to be removed though). If most of your reads were removed as chimeric, upstream processing may need to be revisited. In almost all cases this is caused by primer sequences with ambiguous nucleotides that were not removed prior to beginning the DADA2 pipeline-usually means that your sequencing center sucks and you should email them
+
+```{r}
+seqtab.nochim <- removeBimeraDenovo(seqtab, method="consensus", multithread=FALSE, verbose=TRUE)
+dim(seqtab.nochim)
+sum(seqtab.nochim)/sum(seqtab)
+```
+
+#Finally we can check our progress by making a table that tracks the number of reads that made it through each pipeline step:
+#This is a good table to include in your supplementary data for your thesis paper and a great place to do a last sanity check. Outside of filtering, there should no step in which a majority of reads are lost. If a majority of reads failed to merge, you may need to revisit the truncLen parameter used in the filtering step and make sure that the truncated reads span your amplicon. If a majority of reads were removed as chimeric, you may need to revisit the removal of primers, as the ambiguous nucleotides in unremoved primers interfere with chimera identification
+
+```{r}
+getN <- function(x) sum(getUniques(x))
+track <- cbind(out, sapply(dadaFs, getN), sapply(dadaRs, getN), sapply(mergers, getN), rowSums(seqtab.nochim))
+# If processing a single sample, remove the sapply calls: e.g. replace sapply(dadaFs, getN) with getN(dadaFs)
+colnames(track) <- c("input", "filtered", "denoisedF", "denoisedR", "merged", "nonchim")
+rownames(track) <- sample.names
+head(track)
+```
+
+#Now we can assign the taxa to each sequence variant using the Silva database:
+
+```{r}
+taxa <- assignTaxonomy(seqtab.nochim,"C:/Users/Jenna/Documents/Bioinfo/Assignment_3/silva_nr99_v138.1_train_set.fa.gz", multithread=FALSE)
+```
+
+#This is an optional step to assign species level classification to the seqeunces:
+
+```{r}
+taxa <- addSpecies(taxa, "C:/Users/Jenna/Documents/Bioinfo/Assignment_3/silva_species_assignment_v138.1.fa.gz")
+```
+
+#Then we can inspect the taxonomic assignments:
+
+```{r}
+taxa.print <- taxa # Removing sequence rownames for display only
+rownames(taxa.print) <- NULL
+head(taxa.print)
+```
+
+
+#Now is a good time to save our work as CSV files which are nice so you can open it in excel. Also nice to save track file for use in supplement.
+
+```{r}
+write.csv(taxa, file="C:/Users/Jenna/Documents/Bioinfo/Assignment_3/taxa.csv")
+write.csv(seqtab.nochim, file = "C:/Users/Jenna/Documents/Bioinfo/Assignment_3/seqtab.nochim.csv")
+write.csv(track, file = "C:/Users/Jenna/Documents/Bioinfo/Assignment_3/track.csv")
+```
+
+
+#This is the ideal stopping place if you are able to get to it in one session (likely won't happen unfortunately when processing for your own project but we can dream)#
+
+##With our data collected from the dada2 pipeline, we now switch to using phyloseq. From this point it is assumedthat you are starting from files saved on your computer
+
+
+#First we need to load in our saved files
+
+taxa <- read.csv (file = "C:/Users/Jenna/Documents/Bioinfo/Assignment_3/taxa.csv")
+
+#For our seqtab.nochim data we use "header=FALSE" to tell R that we don't want the sequences to be the "row names"
+
+seqtab.nochim <- read.csv (file="C:/Users/Jenna/Documents/Bioinfo/Assignment_3/seqtab.nochim.csv", header= FALSE)
+
+#Next, in order to use the seqtab.nochim data, we need to transpose it match the taxa file structure 
+
+```{r}
+flipped_seqtab.nochim<- as.data.frame(t(seqtab.nochim))
+```
+
+#Inspect your flipped file and check what the header looks like. The file may have an extra header that is not the sample names and in this case we want to delete the extra header which can be done with the chunk below: 
+
+```{r}
+colnames(flipped_seqtab.nochim) <- flipped_seqtab.nochim[1,]
+flipped_seqtab.nochim <- flipped_seqtab.nochim[-1,]
+#Now inspect again and ensure it is correct
+```
+
+#Next we are going to change the names of the sequences to "ASVS" to make it look nicer:
+
+```{r}
+rownames(flipped_seqtab.nochim) <- paste0("ASV", 1:nrow(flipped_seqtab.nochim))
+```
+
+#and then we can remove the sequences column: 
+
+```{r}
+flipped_seqtab.nochim_forself <- flipped_seqtab.nochim[,-1]
+```
+
+#The file should now look better and we should save this transposed file in case we need it later and don't want to run the code again:
+
+```{r}
+write.csv(flipped_seqtab.nochim, file="C:/Users/Jenna/Documents/Bioinfo/Assignment_3/flipped_seqtab.nochim.csv")
+```
+
+#Optionally you can save your flipped_seqtab.nochim file with your taxa data as one data sheet which can be helpful to have for later in case you need it:
+
+```{r}
+OTUabund<-cbind(flipped_seqtab.nochim, taxa)
+write.csv(OTUabund, file="C:/Users/Jenna/Documents/Bioinfo/Assignment_3/OTUabund.csv")
+```
+
+
+#Now we can get things ready to use phyloseq :) First we need to load the requisite libraries:
+
+```{r}
+library(dada2); packageVersion("dada2")
+library(phyloseq)
+library(ggplot2)
+library(Biostrings)
+library(RColorBrewer)
+```
+
+#Phyloseq has a specific file format it likes input files to be in so we're going to alter our taxa dataframe to makes sure it fits the requirements (make sure it doesn't list ASVs or sequences in its first column). Make sure to check your taxa file before and after running this step to make sure that the sequences you see in the first column before running the code are gone after it has been run. 
+
+```{r}
+taxa<-taxa[-1]
+```
+
+#Then we want to do the same for our OTU table and delete the first column containing the sequences. Again make sure to check the table before and after this step!
+
+```{r}
+flipped_seqtab.nochim[,-1]
+```
+
+#Now we want to make both our taxa and OTU data into matrices (we will name them taxmat and otumat, respectively) for phyloseq to work with:
+
+```{r}
+taxmat <- as.matrix(taxa)
+otumat <-as.matrix(flipped_seqtab.nochim)
+
+#Then inspect both files to make sure that they are in fact both matrices (each file should be a matrix array)
+class(otumat)
+class(taxmat)
+
+#Then to be consistent we make sure that the rownames for both files are the same and labelled by ASV
+rownames(otumat) <- paste0("ASV", 1:nrow(otumat))
+rownames(taxmat) <- paste0("ASV", 1:nrow(otumat))
+
+#Lastly we want to make sure that R recognizes that the OTU data is numeric, not character data
+class(otumat)<-"numeric"
+```
+
+#If both otumat and taxmat are matrices then we are good to move forward with running it through phyloseq.Our next step for this is to tell phyloseq where to find our "OTUs" (ASVs) and our "Taxa" files.
+
+```{r}
+OTU = otu_table(otumat, taxa_are_rows = TRUE)
+
+TAX = tax_table(taxmat)
+```
+
+#Now that phyloseq knows where to find our data we can tell it to put it all together (sample names, OTU and taxa):
+
+```{r}
+physeq = phyloseq(OTU, TAX)
+physeq
+sample_names(physeq)
+samplenames<-sample_names(physeq)
+```
+
+
+#Finally we can graph our results! We first will graph absolute abundance to start. When graphing we use a "stacked" geom_bar to avoid having excessive lines that seperate each individual ASV 
+
+```{r}
+pstacked<- plot_bar(physeq, fill = "Phylum") + geom_bar(aes(fill=Phylum), stat="identity", position="stack")
+pstacked
+```
+
+#Since we are interested in graphing relative abundance, we need to do a couple more steps:
+
+#First - we use phyloseq's "tax_glom" fucntion to glom together taxa based on the column of your choosing (we are first going to look at the Phylum column. *note- tax_glom can also be used instead of "stacking" to graph the ASVs together nicely. 
+
+```{r}
+ps_phylum <- tax_glom(physeq, "Phylum")
+```
+
+#After taxa has been glomed by Phylum, we need to actually calculate relative abundance in order to graph it: to do this we will make a table that tallies up each taxa, and divides them by the total taxa ( eg. what percentage of the total is each phylum in each sample). 
+
+```{r}
+ps_phylum_relabun <- transform_sample_counts(ps_phylum, function(ASV) ASV/sum(ASV))
+taxa_abundance_table_phylum <- psmelt(ps_phylum_relabun)
+taxa_abundance_table_phylum$Phylum<-factor(taxa_abundance_table_phylum$Phylum)
+```
+
+#And now with relative abundance calulated we can graph it!
+
+```{r}
+phyl_abun<-plot_bar(ps_phylum_relabun, fill = "Phylum", title= "Phyla Relative Abundance in Pumice Rock")
+phstacked<- phyl_abun + geom_bar(aes(fill=Phylum), stat="identity", position="stack")+ ylab("Relative Abundance (%)")
+
+phstacked
+```
+#Next we can do the exact same steps with Order (this is a great example of how the code can be altered to use on different columns of interest:
+
+#First absolute abundance:
+
+```{r}
+ostacked<- plot_bar(physeq, fill = "Order") + geom_bar(aes(fill=Phylum), stat="identity", position="stack")
+ostacked
+```
+
+#Then we move onto using glom and calculating relative abundance using Order now instead of Phylum
+
+```{r}
+ps_order<- tax_glom(physeq, "Order")
+```
+
+
+```{r}
+ps_order_relabun <- transform_sample_counts(ps_order, function(ASV) ASV/sum(ASV))
+taxa_abundance_table_order <- psmelt(ps_order_relabun)
+taxa_abundance_table_order$Order<-factor(taxa_abundance_table_order$Order)
+```
+
+#And then we graph again!
+
+```{r}
+o_abun<-plot_bar(ps_order_relabun, fill = "Order", title="Order Relative Abundance in Pumice Rock")
+
+orstacked<- o_abun + geom_bar(aes(fill=Order), stat="identity", position="stack") + ylab("Relative Abundance (%)")
+
+orstacked
+```
+
+
+#Lastly another alternative for graphing could be to use a geom_point plot instead if you don't like the look of the bar charts. To do this you first need to "smelt" your relative abundance object of interest which makes a copy of the data as a dataframe instead of a phyloseq object (ggplot can't recognize it otherwise).
+
+```{r}
+smelt_phyl_abun<-psmelt(ps_phylum_relabun)
+```
+
+#Then we can plug our "smelted" data into ggplot and we get our graph!
+
+```{r}
+phyl_point<-ggplot(smelt_phyl_abun, aes(Sample,Phylum)) +geom_point(aes(size=Abundance, color=Phylum))+guides(color=FALSE)+labs(title="Phyla Relative Abundance (%) in Pumice Rock")+theme_bw()
+
+phyl_point
+```
+
